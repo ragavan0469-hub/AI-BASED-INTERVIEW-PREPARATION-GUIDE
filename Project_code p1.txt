@@ -1,0 +1,633 @@
+import re
+import json
+import fitz
+import os
+import PyPDF2
+import gradio as gr
+from crewai import Agent, Task, Crew, Process
+from langchain_groq import ChatGroq
+import litellm
+import shutil
+from pathlib import Path
+import time
+import random
+import pandas as pd
+from typing import List, Tuple, Union, Dict
+from pydantic import BaseModel, Field
+
+# --- 1. Configuration and LLM Setup ---
+os.environ["GROQ_API_KEY"] = "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"
+
+litellm.drop_params = True
+litellm.api_base = "https://api.groq.com/openai/v1"
+litellm.api_key = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = "groq/llama-3.3-70b-versatile"
+
+if not os.getenv("GROQ_API_KEY"):
+    print("Warning: GROQ_API_KEY not found. LLM-dependent features will fail.")
+    llm_text = None
+else:
+    llm_text = ChatGroq(model=GROQ_MODEL, api_key=os.getenv("GROQ_API_KEY"))
+
+DATA_PATH = "resume_analysis_dashboard.csv"
+
+# --- Pydantic Models for Structured LLM Output ---
+class QuizQuestion(BaseModel):
+    """A single multiple-choice question with options and the correct answer."""
+    question: str = Field(description="The generated multiple-choice question.")
+    options: List[str] = Field(description="Exactly 4 plausible but distinct options for the question.")
+    correct_answer: str = Field(description="The correct option *text* (must be one of the options).")
+
+# NEW Pydantic Model to structure project extraction
+class ProjectContext(BaseModel):
+    """A list of project titles and their corresponding detailed descriptions."""
+    projects: List[Dict[str, str]] = Field(description="A list where each item is a dictionary with 'title' and 'description'.")
+
+
+# --- 2. CrewAI Agents ---
+if llm_text:
+    extract_projects_agent = Agent(
+        role="Project Extractor",
+        goal=("Extract all *project titles* from the resume text and don’t add redundant data from the same project. "
+              "Return only the titles, not descriptions. Respond strictly as JSON array of strings."),
+        backstory="You identify project titles precisely from resumes.",
+        llm=llm_text, verbose=False
+    )
+    # NEW AGENT: To extract full context for question generation
+    context_extractor_agent = Agent(
+        role="Project Contextual Detail Extractor",
+        goal=(
+            "From the provided resume text, extract the title and the *full paragraph description/details* for every project mentioned. "
+            "Return the data strictly as a JSON object matching the ProjectContext schema."
+        ),
+        backstory="You are meticulous in pairing project titles with their complete technical descriptions.",
+        llm=llm_text,
+        verbose=False,
+    )
+    evaluate_projects_agent = Agent(
+        role="Project Evaluator",
+        goal=("Take a JSON array of project titles and compare them against the job description. "
+              "Output a JSON dictionary where each key is a project title, "
+              "and each value is {'label':'FIT' or 'CHANGE', 'reason':'short justification'}."),
+        backstory="You are a professional recruiter labeling each project as FIT or CHANGE.",
+        llm=llm_text, verbose=False
+    )
+    improvements_agent = Agent(
+        role="Resume Improvement Expert",
+        goal="Suggest actionable improvements to the resume’s projects section based on evaluation.",
+        backstory="You specialize in resume optimization and job role alignment.",
+        llm=llm_text, verbose=False
+    )
+    quiz_master_agent = Agent(
+        role="Technical Interview Question Generator",
+        goal=(
+            "Generate a highly specific, multiple-choice question about the project context provided. "
+            "You MUST AVOID asking questions that are present in the 'Previously Asked Questions' list. "
+            "The question must have 4 plausible but distinct options and one clear correct answer. "
+            "Output the response strictly as a JSON object matching the QuizQuestion schema."
+        ),
+        backstory="You are a senior hiring manager specializing in technical screening. You ensure questions test deep, non-repeated knowledge.",
+        llm=llm_text,
+        verbose=False
+    )
+
+
+# --- 3. Helper Functions ---
+# (Helper functions like highlight_projects_in_pdf, create_project_evaluation_html, save_to_dashboard, load_dashboard_data, safe_json_parse remain unchanged)
+
+def highlight_projects_in_pdf(pdf_path, output_path, project_labels):
+    doc = fitz.open(pdf_path)
+    colors = {'FIT': (0, 0.7, 0), 'CHANGE': (0.9, 0, 0)}
+    for page in doc:
+        page_text = page.get_text()
+        for proj_name, data in project_labels.items():
+            label = data.get("label", "CHANGE")
+            lower_text = page_text.lower()
+            lower_proj = proj_name.lower()
+            start = 0
+            while True:
+                idx = lower_text.find(lower_proj, start)
+                if idx == -1:
+                    break
+                text_instances = page.search_for(page_text[idx:idx+len(proj_name)])
+                for inst in text_instances:
+                    annot = page.add_highlight_annot(inst)
+                    annot.set_colors(stroke=colors.get(label, (0.9, 0, 0)))
+                    annot.update()
+                start = idx + len(proj_name)
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    doc.save(output_path)
+    doc.close()
+
+def create_project_evaluation_html(project_labels):
+    css_style = """
+    <style>
+    .project-list li { list-style-type: disc; margin-left: 10px; color: #1F2937; padding: 5px 0; }
+    .label-fit, .label-change { font-weight: bold; padding: 2px 6px; border-radius: 6px; margin-left: 10px; cursor: pointer; position: relative; display: inline-block; color: black; font-size: 0.9em; }
+    .label-fit { background-color: #6CFF5B; }
+    .label-change { background-color: #FF6C6C; }
+    .tooltip .tooltiptext {
+        visibility: hidden; width: 300px; background-color: #383838; color: #fff; text-align: left; border-radius: 6px; padding: 10px; position: absolute; z-index: 10; bottom: 125%; left: 0%; opacity: 0; transition: opacity 0.3s; font-size: 13px; line-height: 1.4; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.4);
+    }
+    .tooltip .tooltiptext::after { content: ""; position: absolute; top: 100%; left: 20px; margin-left: -5px; border-width: 5px; border-style: solid; border-color: #383838 transparent transparent transparent; }
+    .tooltip:hover .tooltiptext { visibility: visible; opacity: 1; }
+    </style>
+    """
+    if not project_labels:
+        return css_style + "<p style='color: white;'>No project evaluation data available.</p>"
+    html_list = "<ul class='project-list' style='color: #1F2937;'>"
+    for title, data in project_labels.items():
+        label = data.get("label", "N/A").upper()
+        reason = data.get("reason", "No reason provided.").strip()
+        css_class = "label-fit" if label == "FIT" else "label-change"
+        html_list += f"""
+        <li style="color: #1F2937;">
+            <span style="font-weight: 500;">{title.strip()}</span>
+            <span class="tooltip {css_class}">
+                {label}
+                <span class="tooltiptext"><b>Reason:</b> {reason}</span>
+            </span>
+        </li>
+        """
+    html_list += "</ul>"
+    return css_style + html_list
+
+def save_to_dashboard(resume_name, role, job_desc, project_labels):
+    summary = {
+        "resume_name": resume_name,
+        "role": role,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "fit_count": sum(1 for v in project_labels.values() if v.get("label") == "FIT"),
+        "change_count": sum(1 for v in project_labels.values() if v.get("label") == "CHANGE"),
+        "projects": json.dumps(project_labels, indent=2),
+        "job_description": job_desc[:200] + ("..." if len(job_desc) > 200 else "")
+    }
+    df = pd.DataFrame([summary])
+    if os.path.exists(DATA_PATH):
+        df.to_csv(DATA_PATH, mode="a", header=False, index=False)
+    else:
+        df.to_csv(DATA_PATH, index=False)
+
+def load_dashboard_data():
+    if not os.path.exists(DATA_PATH):
+        return pd.DataFrame(columns=["resume_name", "role", "timestamp", "fit_count", "change_count", "job_description"])
+    return pd.read_csv(DATA_PATH)
+
+def safe_json_parse(text, default):
+    try:
+        cleaned = text.replace("```json", "").replace("```", "").strip()
+        return json.loads(cleaned)
+    except Exception:
+        return default
+
+
+# --- MODIFIED: resume_analysis_pipeline to run NEW context extractor ---
+def resume_analysis_pipeline(temp_pdf_path, job_description, role):
+    if not llm_text:
+        return "LLM not configured.", "/tmp/dummy.pdf", {}, [], "", []
+
+    highlighted_pdf_path = "/tmp/resume_highlighted.pdf"
+    with open(temp_pdf_path, "rb") as f:
+        reader = PyPDF2.PdfReader(f)
+        resume_text = "".join((page.extract_text() or "") + "\n" for page in reader.pages)
+
+    # 1. Project Title Extraction (unchanged)
+    extract_task = Task(
+        description=f"Extract project titles from this resume text:\n{resume_text[:6000]}",
+        agent=extract_projects_agent,
+        expected_output="Return a JSON array of project titles, e.g. ['Project A', 'Project B', 'Project C']"
+    )
+    crew_extract = Crew(agents=[extract_projects_agent], tasks=[extract_task], process=Process.sequential)
+    raw_extract = str(crew_extract.kickoff())
+    project_titles = safe_json_parse(raw_extract, [])
+
+    # 2. NEW: Project Context Extraction for question generation
+    context_task = Task(
+        description=f"Extract titles and full descriptions for projects matching this list: {project_titles}. Use the full resume text:\n{resume_text[:6000]}",
+        agent=context_extractor_agent,
+        expected_output="A valid JSON object matching the ProjectContext schema.",
+        output_pydantic=ProjectContext
+    )
+    crew_context = Crew(agents=[context_extractor_agent], tasks=[context_task], process=Process.sequential)
+    try:
+        context_result = crew_context.kickoff()
+        # Convert Pydantic object to a simple list of dicts for state storage
+        project_context_list = context_result.projects
+    except Exception as e:
+        print(f"Error extracting project context: {e}")
+        project_context_list = []
+
+    # 3. Project Evaluation (unchanged)
+    evaluate_task = Task(
+        description=f"Evaluate these projects {project_titles} for the role '{role}' and JD: {job_description}",
+        agent=evaluate_projects_agent,
+        expected_output="Return a JSON dictionary where each key is a project title and each value is {'label': 'FIT' or 'CHANGE', 'reason': 'short justification'}"
+    )
+    crew_eval = Crew(agents=[evaluate_projects_agent], tasks=[evaluate_task], process=Process.sequential)
+    eval_raw = str(crew_eval.kickoff())
+    project_labels = safe_json_parse(eval_raw, {})
+
+    # 4. Resume Improvement (unchanged)
+    improve_task = Task(
+        description=f"Suggest improvements for role '{role}' based on {json.dumps(project_labels)}",
+        agent=improvements_agent,
+        expected_output="Return concise bullet-point suggestions for improving resume projects"
+    )
+    crew_improve = Crew(agents=[improvements_agent], tasks=[improve_task], process=Process.sequential)
+    improvements = str(crew_improve.kickoff())
+
+    highlight_projects_in_pdf(temp_pdf_path, highlighted_pdf_path, project_labels)
+    save_to_dashboard(os.path.basename(temp_pdf_path), role, job_description, project_labels)
+
+    # MODIFIED: Return project_context_list instead of raw resume_text
+    return improvements, highlighted_pdf_path, project_labels, project_titles, project_context_list
+
+# --- MODIFIED: gradio_analyze_resume to handle project_context_list ---
+def gradio_analyze_resume(resume_file, job_description, role):
+    if resume_file is None or not job_description or not role:
+        return "## Error\nPlease provide all inputs.", "<p style='color: red;'>Incomplete inputs.</p>", None, [], []
+    if not llm_text:
+         return "## Error\nLLM not initialized. Check GROQ_API_KEY.", "<p style='color: red;'>LLM Error.</p>", None, [], []
+
+    temp_path = os.path.join("/tmp", os.path.basename(resume_file.name))
+    shutil.copyfile(resume_file.name, temp_path)
+
+    improvements, pdf_path, labels, project_titles, project_context_list = resume_analysis_pipeline(temp_path, job_description, role)
+
+    eval_html = create_project_evaluation_html(labels)
+    improvements_md = f"## Suggested Improvements\n\n{improvements}"
+
+    # MODIFIED: Return project_context_list
+    return improvements_md, eval_html, pdf_path, project_titles, project_context_list
+
+# --- 4. Gradio Logic ---
+def refresh_dashboard():
+    df = load_dashboard_data()
+    if df.empty:
+        return gr.update(visible=False), gr.update(value="No past resume analyses found.", visible=True)
+    return gr.update(value=df, visible=True), gr.update(visible=False)
+
+
+# --- 5. Mock Test Functions ---
+
+# --- MODIFIED: generate_mock_questions for contextual questions and no-repeat logic ---
+def generate_mock_questions(project_titles: List[str], project_context_list: List[Dict[str, str]], asked_questions: List[str], current_generate_btn_visibility):
+
+    if not project_titles:
+        updates = [gr.update(label="No projects available from resume analysis to generate questions.", choices=[], visible=True)]
+        updates.extend([gr.update(visible=False) for _ in range(4)])
+        return (*updates, gr.update(visible=False), asked_questions, {}, gr.update(visible=False))
+
+    questions_data = []
+
+    # Create a mapping from title to context for easier access
+    context_map = {p['title']: p['description'] for p in project_context_list}
+
+    # Use only the first 5 projects for the quiz set
+    projects_to_quiz = project_titles[:5]
+
+    for proj_title in projects_to_quiz:
+        proj_context = context_map.get(proj_title, "No detailed description available.")
+
+        task = Task(
+            description=(
+                f"Generate a new, unique technical multiple-choice question (MCQ) about the project: '{proj_title}'. "
+                f"The question must focus on a key technical aspect, algorithm, or metric. "
+                f"You MUST NOT ask any question that is semantically similar to the following previously asked questions: {asked_questions}. "
+                f"Use the following project context for details: \n"
+                f"--- PROJECT CONTEXT ---\n{proj_context}\n"
+            ),
+            agent=quiz_master_agent,
+            expected_output="A valid JSON object matching the QuizQuestion schema: {'question': '...', 'options': ['...', '...', '...', '...'], 'correct_answer': '...'}",
+        )
+        crew = Crew(agents=[quiz_master_agent], tasks=[task], process=Process.sequential)
+
+        try:
+            raw_result = crew.kickoff()
+            qa_data = safe_json_parse(str(raw_result), {})
+
+            if qa_data and all(k in qa_data for k in ['question', 'options', 'correct_answer']):
+                questions_data.append(qa_data)
+                # APPEND the new question to the asked list
+                asked_questions.append(qa_data['question'])
+        except Exception as e:
+            print(f"Error generating question for {proj_title}: {e}")
+            continue
+
+    # --- Process Results for Gradio Output ---
+    questions = []
+    options_list = []
+    answers = []
+
+    for qa_data in questions_data:
+        questions.append(qa_data['question'])
+        options_list.append(qa_data['options'])
+        answers.append(qa_data['correct_answer'])
+
+    state_data = {
+        "questions": questions,
+        "options": options_list,
+        "answers": answers,
+        "user_answers": [None] * len(questions)
+    }
+
+    updates = []
+    num_questions = len(questions)
+
+    if num_questions == 0:
+        updates.append(gr.update(label="LLM failed to generate any valid questions.", choices=[], visible=True))
+        updates.extend([gr.update(visible=False) for _ in range(4)])
+        return (*updates, gr.update(visible=False), asked_questions, state_data, gr.update(visible=False))
+
+    for i in range(5):
+        if i < num_questions:
+            current_options = state_data["options"][i]
+            current_answer = state_data["answers"][i]
+            if current_answer not in current_options:
+                current_options.append(current_answer)
+                random.shuffle(current_options)
+
+            updates.append(gr.update(
+                label=questions[i],
+                choices=current_options,
+                visible=True,
+                value=None
+            ))
+        else:
+            updates.append(gr.update(visible=False, value=None))
+
+    # HIDE the initial "Generate First 5 Questions" button after the first successful run
+    new_generate_btn_visibility = gr.update(visible=False)
+
+    # MODIFIED RETURN: includes the updated asked_questions list
+    return (*updates, gr.update(visible=True), asked_questions, state_data, new_generate_btn_visibility)
+
+# --- Unchanged Mock Test Helpers ---
+def evaluate_mock_answers(state_data: dict, *user_answers: str):
+    state = state_data
+    num_questions = len(state.get("questions", []))
+    actual_answers = list(user_answers)[:num_questions]
+    state["user_answers"] = actual_answers
+
+    results_md = "<p style='color: white; font-size: 1.2em;'>**Mock Test Results**</p>"
+    correct_count = 0
+
+    for i, (ua, ca) in enumerate(zip(state["user_answers"], state["answers"])):
+        ua_display = ua if ua is not None else "No Answer"
+        is_correct = (ua == ca)
+        color = "green" if is_correct else "red"
+        if is_correct: correct_count += 1
+
+        results_md += f"**Q{i+1}:** {state['questions'][i]}\n- Your answer: <span style='color:{color};'>{ua_display}</span>\n- Correct answer: {ca}\n\n"
+
+    total_questions = len(state["questions"])
+    score = f"**Score: {correct_count}/{total_questions}**"
+
+    return (
+        f"## Test Complete! {score}\n\n{results_md}",
+        gr.update(visible=True),
+        state
+    )
+
+# --- MODIFIED: next_mock_set now passes asked_questions and project_context_list ---
+def next_mock_set(project_titles: List[str], project_context_list: List[Dict[str, str]], asked_questions: List[str]):
+
+    # The current logic will re-run the question generation against the same pool (first 5 titles)
+    # but the agent is now constrained by the asked_questions list.
+
+    # Output structure from generate_mock_questions is:
+    # (*Q_RADIOS updates, submit_btn update, asked_questions_state update, mock_state_component update, generate_btn update)
+    generated_updates = generate_mock_questions(project_titles, project_context_list, asked_questions, False)
+
+    # The required outputs for next_set_btn.click are:
+    # [results_md, next_set_btn, *Q_RADIOS, submit_btn, mock_state_component, generate_first_5_btn, asked_questions_state]
+
+    # We must prepend the manual updates for results_md and next_set_btn,
+    # and adjust the order of the generated_updates.
+
+    radio_updates = generated_updates[:5]
+    submit_btn_update = generated_updates[5]
+    updated_asked_questions = generated_updates[6]
+    state_data = generated_updates[7]
+    generate_btn_update = generated_updates[8]
+
+    return (
+        # 1. results_md: Clear previous results
+        gr.update(value="", visible=True),
+        # 2. next_set_btn: Hide itself
+        gr.update(visible=False),
+        # 3. to 7. are the 5 Q_RADIOS updates
+        *radio_updates,
+        # 8. submit_btn update (shown by generate_mock_questions)
+        submit_btn_update,
+        # 9. mock_state_component
+        state_data,
+        # 10. generate_first_5_btn update (hidden by generate_mock_questions)
+        generate_btn_update,
+        # 11. asked_questions_state update
+        updated_asked_questions
+    )
+
+
+# --- 6. UI Design (Refactored) ---
+CUSTOM_THEME_CSS = """
+/* Overall container */
+.gradio-container {
+    background: linear-gradient(135deg, #1E1E2F, #2A2A3F);
+    color: #E0E0E0;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+/* Headings and markdown */
+h1, h2, h3, .gr-markdown {
+    color: #FFFFFF !important;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.6);
+}
+
+/* Tabs styling */
+.gradio-tabs {
+    background-color: #252537;
+    border-radius: 10px;
+    padding: 5px;
+}
+.gradio-tab {
+    color: #FFFFFF;
+    background-color: #3B3B56;
+    border-radius: 8px;
+    margin: 2px;
+}
+.gradio-tab:focus, .gradio-tab:active {
+    background-color: #5C5CA3 !important;
+}
+
+/* File upload */
+.gr-file-drop {
+    background-color: #3B3B56;
+    border: 2px dashed #5C5CA3;
+    color: #E0E0E0;
+    border-radius: 10px;
+}
+.gr-file-drop:hover {
+    background-color: #4C4C6C;
+}
+
+/* Textboxes and Textareas */
+.gr-textbox, .gr-textarea {
+    background-color: #3B3B56 !important;
+    color: #E0E0E0 !important;
+    border: 1px solid #5C5CA3 !important;
+    border-radius: 8px;
+}
+.gr-textbox:focus, .gr-textarea:focus {
+    border-color: #7C5AFF !important;
+    box-shadow: 0 0 5px #7C5AFF;
+}
+
+/* Buttons */
+.gr-button, .gr-button:hover, .gr-button:active {
+    background-color: #7C5AFF !important;
+    color: white !important;
+    border-radius: 10px !important;
+    border: none !important;
+}
+.gr-button:hover {
+    background-color: #A078FF !important;
+}
+
+/* Radio buttons */
+.gr-radio input[type="radio"] + label {
+    color: #E0E0E0;
+}
+.gr-radio input[type="radio"]:checked + label {
+    color: #FFFFFF;
+    font-weight: 600;
+}
+
+/* DataFrame / Tables */
+.gr-dataframe table {
+    background-color: #3B3B56 !important;
+    color: #E0E0E0 !important;
+}
+.gr-dataframe th {
+    background-color: #5C5CA3 !important;
+    color: #FFFFFF !important;
+}
+
+/* Markdown & HTML content in evaluation */
+.gr-html, .gr-markdown {
+    background-color: #2C2C42 !important;
+    padding: 10px;
+    border-radius: 8px;
+    color: #E0E0E0;
+}
+
+/* Tabs inner panels */
+.gradio-panel {
+    background-color: #2C2C42 !important;
+    border-radius: 10px;
+    padding: 15px;
+}
+"""
+
+# --- Define Blocks ---
+with gr.Blocks(title="AI Resume Analyzer", css=CUSTOM_THEME_CSS) as demo:
+    gr.Markdown("# 🤖 AI-Powered Resume Analyzer with Dashboard & Mock Test")
+
+    # Global states shared across tabs
+    project_titles_state = gr.State([])
+    # MODIFIED: Stores the structured context (title + description) instead of raw text
+    project_context_state = gr.State([])
+    # NEW STATE: To track all questions ever asked to prevent repetition
+    asked_questions_state = gr.State([])
+
+    mock_state_component = gr.State(
+        {
+            "questions": [],
+            "options": [],
+            "answers": [],
+            "user_answers": []
+        }
+    )
+
+    # --- Analyze Resume Tab ---
+    with gr.Tab("🔍 Analyze Resume"):
+        with gr.Row():
+            with gr.Column(scale=1):
+                uploaded_resume = gr.File(label="Upload Resume (PDF)", file_types=[".pdf"])
+                job_description = gr.Textbox(label="Job Description", lines=4)
+                job_role = gr.Textbox(label="Job Role", placeholder="e.g. Game Designer, Data Scientist")
+                analyze_btn = gr.Button("Analyze Resume", variant="primary")
+            with gr.Column(scale=2):
+                gr.Markdown("### 💡 Project Evaluation & Suggestions")
+                project_eval_html = gr.HTML("<p style='color:white;'>Awaiting analysis...</p>")
+                improvements_md = gr.Markdown("Analysis results will appear here...")
+                highlighted_pdf = gr.File(label="📄 Download Highlighted PDF", type="filepath")
+
+        analyze_btn.click(
+            fn=gradio_analyze_resume,
+            inputs=[uploaded_resume, job_description, job_role],
+            # MODIFIED: Output includes project_context_state (and retains order)
+            outputs=[improvements_md, project_eval_html, highlighted_pdf, project_titles_state, project_context_state]
+        )
+
+    # --- Dashboard Tab ---
+    with gr.Tab("📊 Dashboard"):
+        gr.Markdown("### 📁 Resume Analysis History")
+        dashboard_btn = gr.Button("🔄 Refresh Dashboard")
+        dashboard_msg = gr.Markdown("Click refresh to load history.", visible=True)
+        dashboard_table = gr.DataFrame(headers=["resume_name", "role", "timestamp", "fit_count", "change_count", "job_description"], visible=False)
+
+        dashboard_btn.click(
+            fn=refresh_dashboard,
+            inputs=[],
+            outputs=[dashboard_table, dashboard_msg]
+        )
+
+    # --- Mock Test Tab ---
+    with gr.Tab("📝 Mock Test"):
+        gr.Markdown("### Test Yourself Based on Your Resume Projects")
+
+        with gr.Column() as questions_container:
+            Q_RADIOS = [
+                gr.Radio(
+                    label=f"Question {i+1} Placeholder",
+                    choices=[],
+                    visible=False,
+                    type="value"
+                )
+                for i in range(5)
+            ]
+
+        generate_first_5_btn = gr.Button("Generate First 5 Questions", variant="secondary", visible=True)
+        submit_btn = gr.Button("Submit Answers", visible=False)
+        results_md = gr.Markdown()
+        next_set_btn = gr.Button("Next Set", visible=False)
+
+        # Generate questions
+        generate_first_5_btn.click(
+            fn=generate_mock_questions,
+            # MODIFIED: Inputs are project_titles, project_context_state, asked_questions_state, and the button itself
+            inputs=[project_titles_state, project_context_state, asked_questions_state, generate_first_5_btn],
+            # MODIFIED: Output order matches the return, including asked_questions_state
+            outputs=[*Q_RADIOS, submit_btn, asked_questions_state, mock_state_component, generate_first_5_btn]
+        )
+
+        # Evaluate answers
+        submit_btn.click(
+            fn=evaluate_mock_answers,
+            inputs=[mock_state_component, *Q_RADIOS],
+            outputs=[results_md, next_set_btn, mock_state_component]
+        )
+
+        # Next set (clears previous results and generates new questions)
+        next_set_btn.click(
+            fn=next_mock_set,
+            # MODIFIED: Inputs are project_titles, project_context_state, asked_questions_state
+            inputs=[project_titles_state, project_context_state, asked_questions_state],
+            # MODIFIED: Output order matches the return tuple from next_mock_set
+            outputs=[results_md, next_set_btn, *Q_RADIOS, submit_btn, mock_state_component, generate_first_5_btn, asked_questions_state]
+        )
+
+
+if __name__ == "__main__":
+    demo.launch(share=True, debug=True)
